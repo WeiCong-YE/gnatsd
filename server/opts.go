@@ -257,6 +257,7 @@ type TLSConfigOpts struct {
 	KeyFile          string
 	CaFile           string
 	Verify           bool
+	Insecure         bool
 	Map              bool
 	Timeout          float64
 	Ciphers          []uint16
@@ -1993,6 +1994,12 @@ func parseTLS(v interface{}) (*TLSConfigOpts, error) {
 				return nil, &configErr{tk, fmt.Sprintf("error parsing tls config, expected 'ca_file' to be filename")}
 			}
 			tc.CaFile = caFile
+		case "insecure":
+			insecure, ok := mv.(bool)
+			if !ok {
+				return nil, &configErr{tk, fmt.Sprintf("error parsing tls config, expected 'insecure' to be a boolean")}
+			}
+			tc.Insecure = insecure
 		case "verify":
 			verify, ok := mv.(bool)
 			if !ok {
@@ -2083,6 +2090,7 @@ func GenTLSConfig(tc *TLSConfigOpts) (*tls.Config, error) {
 		PreferServerCipherSuites: true,
 		CurvePreferences:         tc.CurvePreferences,
 		Certificates:             []tls.Certificate{cert},
+		InsecureSkipVerify:       tc.Insecure,
 	}
 
 	// Require client certificates as needed
