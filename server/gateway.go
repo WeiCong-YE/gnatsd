@@ -1594,7 +1594,10 @@ func (c *client) processGatewayRUnsub(arg []byte) error {
 				c.gw.outsim.Delete(accName)
 			}
 		}
-		defer c.srv.updateInterestForAccountOnGateway(accName, sub, -1)
+		srv := c.srv
+		c.mu.Unlock()
+		srv.updateInterestForAccountOnGateway(accName, sub, -1)
+		c.mu.Lock()
 	} else {
 		e.ni[string(subject)] = struct{}{}
 		if newe {
@@ -1697,7 +1700,10 @@ func (c *client) processGatewayRSub(arg []byte) error {
 				c.gw.outsim.Store(string(accName), e)
 			}
 		}
-		defer c.srv.updateInterestForAccountOnGateway(string(accName), sub, 1)
+		srv := c.srv
+		c.mu.Unlock()
+		srv.updateInterestForAccountOnGateway(string(accName), sub, 1)
+		c.mu.Lock()
 	} else {
 		subj := string(subject)
 		// If this is an RS+ for a wc subject, then
