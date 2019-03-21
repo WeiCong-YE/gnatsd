@@ -1708,6 +1708,81 @@ func TestParsingGatewaysErrors(t *testing.T) {
 	}
 }
 
+func TestParsingLeafNodesListener(t *testing.T) {
+	content := `
+	leafnodes {
+		listen: "127.0.0.1:3333"
+		host: "127.0.0.1"
+		port: 3333
+		advertise: "me:22"
+		authorization {
+			user: "derek"
+			password: "s3cr3t!"
+			timeout: 2.2
+		}
+		tls {
+			cert_file: "./configs/certs/server.pem"
+			key_file: "./configs/certs/key.pem"
+			timeout: 3.3
+		}
+	}
+	`
+	conf := createConfFile(t, []byte(content))
+	defer os.Remove(conf)
+	opts, err := ProcessConfigFile(conf)
+	if err != nil {
+		t.Fatalf("Error processing file: %v", err)
+	}
+
+	expected := &LeafNodeOpts{
+		Host:        "127.0.0.1",
+		Port:        3333,
+		Username:    "derek",
+		Password:    "s3cr3t!",
+		AuthTimeout: 2.2,
+		Advertise:   "me:22",
+		TLSTimeout:  3.3,
+	}
+	if opts.LeafNode.TLSConfig == nil {
+		t.Fatalf("Expected TLSConfig, got none")
+	}
+	opts.LeafNode.TLSConfig = nil
+	if !reflect.DeepEqual(&opts.LeafNode, expected) {
+		t.Fatalf("Expected %v, got %v", expected, opts.LeafNode)
+	}
+}
+
+func TestParsingLeafNodeRemotes(t *testing.T) {
+	content := `
+		leafnodes {
+			remotes = [
+				{
+					url: nats-leaf://127.0.0.1:2222
+					account: foobar // Local Account to bind to..
+					credentials: "./my.creds"
+				}
+			]
+		}
+		`
+	conf := createConfFile(t, []byte(content))
+	defer os.Remove(conf)
+	opts, err := ProcessConfigFile(conf)
+	if err != nil {
+		t.Fatalf("Error processing file: %v", err)
+	}
+	if len(opts.LeafNode.Remotes) != 1 {
+		t.Fatalf("Expected 1 remote, got %d", len(opts.LeafNode.Remotes))
+	}
+	expected := &RemoteLeafOpts{
+		LocalAccount: "foobar",
+		Credentials:  "./my.creds",
+	}
+	expected.URL, _ = url.Parse("nats-leaf://127.0.0.1:2222")
+	if !reflect.DeepEqual(opts.LeafNode.Remotes[0], expected) {
+		t.Fatalf("Expected %v, got %v", expected, opts.LeafNode.Remotes[0])
+	}
+}
+
 func TestLargeMaxControlLine(t *testing.T) {
 	confFileName := "big_mcl.conf"
 	defer os.Remove(confFileName)

@@ -531,8 +531,16 @@ func (s *Server) isGatewayAuthorized(c *client) bool {
 
 // isLeafNodeAuthorized will check for auth for an inbound leaf node connection.
 func (s *Server) isLeafNodeAuthorized(c *client) bool {
-	// FIXME(dlc) - Implement the auth checks.
-	return true
+	// Snapshot server options.
+	opts := s.getOpts()
+	if opts.LeafNode.Username == "" {
+		return true
+	}
+
+	if opts.LeafNode.Username != c.opts.Username {
+		return false
+	}
+	return comparePasswords(opts.LeafNode.Password, c.opts.Password)
 }
 
 // Support for bcrypt stored passwords and tokens.

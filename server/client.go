@@ -1015,6 +1015,8 @@ func (c *client) processInfo(arg []byte) error {
 		c.processRouteInfo(&info)
 	case GATEWAY:
 		c.processGatewayInfo(&info)
+	case LEAF:
+		c.processLeafnodeInfo(&info)
 	}
 	return nil
 }

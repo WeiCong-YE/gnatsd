@@ -80,7 +80,7 @@ type RemoteGatewayOpts struct {
 	URLs       []*url.URL  `json:"urls,omitempty"`
 }
 
-// LeafNodeOpts are options for a given server to accept leaf node connections.
+// LeafNodeOpts are options for a given server to accept leaf node connections and/or connect to a remote cluster.
 type LeafNodeOpts struct {
 	Host        string            `json:"addr,omitempty"`
 	Port        int               `json:"port,omitempty"`
@@ -95,13 +95,14 @@ type LeafNodeOpts struct {
 	NoAdvertise bool              `json:"-"`
 }
 
-// RemoteLeaftOpts are options for connecting to a remote server as a leaf node.
+// RemoteLeafOpts are options for connecting to a remote server as a leaf node.
 type RemoteLeafOpts struct {
 	LocalAccount string      `json:"local_account,omitempty"`
+	URL          *url.URL    `json:"url,omitempty"`
+	Credentials  string      `json:"-"`
+	TLS          bool        `json:"-"`
 	TLSConfig    *tls.Config `json:"-"`
 	TLSTimeout   float64     `json:"tls_timeout,omitempty"`
-	URL          *url.URL    `json:"url,omitempty"`
-	// FIXME(dlc) - Add in creds based auth.
 }
 
 // Options block for gnatsd server.
@@ -974,57 +975,30 @@ func parseLeafNodes(v interface{}, opts *Options, errors *[]error, warnings *[]e
 				}
 				*warnings = append(*warnings, err)
 			}
-		case "remote", "remotes":
-			// Could be a single or an array.
-			ra, ok := mv.([]interface{})
-			if !ok {
-				r, ok := mv.(string)
-				if ok {
-					rurl, err := parseURL(r, "leafnode")
-					if err != nil {
-						*errors = append(*errors, err)
-						continue
-					}
-					opts.LeafNode.Remotes = []*RemoteLeafOpts{&RemoteLeafOpts{URL: rurl}}
-				} else {
-					err := &configErr{tk, fmt.Sprintf("Remote definition for a leaf node must be a URL or []URL")}
-					*errors = append(*errors, err)
-					continue
-				}
-			}
-			remotes, errs := parseURLs(ra, "leafnode")
-			if errs != nil {
-				*errors = append(*errors, errs...)
+		case "remotes":
+			// Parse the remote options here.
+			remotes, err := parseRemoteLeafNodes(mv, errors, warnings)
+			if err != nil {
 				continue
 			}
-			opts.LeafNode.Remotes = make([]*RemoteLeafOpts, len(remotes), 0)
-			for _, rurl := range remotes {
-				opts.LeafNode.Remotes = append(opts.LeafNode.Remotes, &RemoteLeafOpts{URL: rurl})
-			}
+			opts.LeafNode.Remotes = remotes
 		case "tls":
-			config, tlsopts, err := getTLSConfig(tk)
+			tc, err := parseTLS(tk)
 			if err != nil {
 				*errors = append(*errors, err)
 				continue
 			}
-			opts.LeafNode.TLSConfig = config
-			opts.LeafNode.TLSTimeout = tlsopts.Timeout
-			opts.LeafNode.TLSMap = tlsopts.Map
+			if opts.LeafNode.TLSConfig, err = GenTLSConfig(tc); err != nil {
+				err := &configErr{tk, err.Error()}
+				*errors = append(*errors, err)
+				continue
+			}
+			opts.LeafNode.TLSTimeout = tc.Timeout
 		case "leafnode_advertise", "advertise":
 			opts.LeafNode.Advertise = mv.(string)
 		case "no_advertise":
 			opts.LeafNode.NoAdvertise = mv.(bool)
 			trackExplicitVal(opts, &opts.inConfig, "LeafNode.NoAdvertise", opts.LeafNode.NoAdvertise)
-			/*
-				case "permissions":
-					perms, err := parseUserPermissions(mv, errors, warnings)
-					if err != nil {
-						*errors = append(*errors, err)
-						continue
-					}
-					// This will possibly override permissions that were define in auth block
-					setClusterPermissions(&opts.Cluster, perms)
-			*/
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
@@ -1039,6 +1013,65 @@ func parseLeafNodes(v interface{}, opts *Options, errors *[]error, warnings *[]e
 		}
 	}
 	return nil
+}
+
+func parseRemoteLeafNodes(v interface{}, errors *[]error, warnings *[]error) ([]*RemoteLeafOpts, error) {
+	tk, v := unwrapValue(v)
+	ra, ok := v.([]interface{})
+	if !ok {
+		return nil, &configErr{tk, fmt.Sprintf("Expected remotes field to be an array, got %T", v)}
+	}
+	remotes := make([]*RemoteLeafOpts, 0, len(ra))
+	for _, r := range ra {
+		tk, r = unwrapValue(r)
+		// Check its a map/struct
+		rm, ok := r.(map[string]interface{})
+		if !ok {
+			*errors = append(*errors, &configErr{tk, fmt.Sprintf("Expected remote leafnode entry to be a map/struct, got %v", r)})
+			continue
+		}
+		remote := &RemoteLeafOpts{}
+		for k, v := range rm {
+			tk, v = unwrapValue(v)
+			switch strings.ToLower(k) {
+			case "url":
+				url, err := parseURL(v.(string), "leafnode")
+				if err != nil {
+					*errors = append(*errors, &configErr{tk, err.Error()})
+					continue
+				}
+				remote.URL = url
+			case "account", "local":
+				remote.LocalAccount = v.(string)
+			case "creds", "credentials":
+				remote.Credentials = v.(string)
+			case "tls":
+				tc, err := parseTLS(tk)
+				if err != nil {
+					*errors = append(*errors, err)
+					continue
+				}
+				if remote.TLSConfig, err = GenTLSConfig(tc); err != nil {
+					*errors = append(*errors, &configErr{tk, err.Error()})
+					continue
+				}
+				remote.TLSTimeout = tc.Timeout
+			default:
+				if !tk.IsUsedVariable() {
+					err := &unknownConfigFieldErr{
+						field: k,
+						configErr: configErr{
+							token: tk,
+						},
+					}
+					*errors = append(*errors, err)
+					continue
+				}
+			}
+		}
+		remotes = append(remotes, remote)
+	}
+	return remotes, nil
 }
 
 // Parse TLS and returns a TLSConfig and TLSTimeout.

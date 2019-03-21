@@ -14,9 +14,11 @@
 package test
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -134,6 +136,13 @@ func TestLeafNodeRequiresConnect(t *testing.T) {
 	if !info.AuthRequired {
 		t.Fatalf("Expected AuthRequired to force CONNECT")
 	}
+	if info.TLSRequired {
+		t.Fatalf("Expected TLSRequired to be false")
+	}
+	if info.TLSVerify {
+		t.Fatalf("Expected TLSVerify to be false")
+	}
+
 	// Now wait and make sure we get disconnected.
 	time.Sleep(5 * time.Millisecond)
 	errBuf := expectResult(t, lc, errRe)
@@ -748,4 +757,109 @@ func TestLeafNodeLocalizedDQ(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		checkMsg(t, matches[i], "foo", "", "", "2", "OK")
 	}
+}
+
+func TestLeafNodeBasicAuth(t *testing.T) {
+	content := `
+	leafnodes {
+		listen: "127.0.0.1:-1"
+		authorization {
+			user: "derek"
+			password: "s3cr3t!"
+			timeout: 2.2
+		}
+	}
+	`
+	conf := createConfFile(t, []byte(content))
+	defer os.Remove(conf)
+
+	s, opts := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	// This should fail since we want u/p
+	setupConn(t, lc)
+	time.Sleep(5 * time.Millisecond)
+	errBuf := expectResult(t, lc, errRe)
+	if !strings.Contains(string(errBuf), "Authorization Violation") {
+		t.Fatalf("Authentication Timeout response incorrect: %q", errBuf)
+	}
+	expectDisconnect(t, lc)
+
+	// Try bad password as well.
+	lc = createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	// This should fail since we want u/p
+	setupConnWithUserPass(t, lc, "derek", "badpassword")
+	time.Sleep(5 * time.Millisecond)
+	errBuf = expectResult(t, lc, errRe)
+	if !strings.Contains(string(errBuf), "Authorization Violation") {
+		t.Fatalf("Authentication Timeout response incorrect: %q", errBuf)
+	}
+	expectDisconnect(t, lc)
+
+	// This one should work.
+	lc = createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	// This should fail since we want u/p
+	leafSend, leafExpect := setupConnWithUserPass(t, lc, "derek", "s3cr3t!")
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	checkLeafNodeConnected(t, s)
+}
+
+func runTLSSolicitLeafServer(lso *server.Options) (*server.Server, *server.Options) {
+	o := DefaultTestOptions
+	o.Host = "127.0.0.1"
+	o.Port = -1
+	rurl, _ := url.Parse(fmt.Sprintf("nats-leaf://%s:%d", lso.LeafNode.Host, lso.LeafNode.Port))
+	remote := &server.RemoteLeafOpts{URL: rurl}
+	remote.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	host, _, _ := net.SplitHostPort(lso.LeafNode.Host)
+	remote.TLSConfig.ServerName = host
+	remote.TLSConfig.InsecureSkipVerify = true
+	o.LeafNode.Remotes = []*server.RemoteLeafOpts{remote}
+	return RunServer(&o), &o
+}
+
+func TestLeafNodeTLS(t *testing.T) {
+	content := `
+	leafnodes {
+		listen: "127.0.0.1:-1"
+		tls {
+			cert_file: "./configs/certs/server-cert.pem"
+			key_file: "./configs/certs/server-key.pem"
+			timeout: 0.1
+		}
+	}
+	`
+	conf := createConfFile(t, []byte(content))
+	defer os.Remove(conf)
+
+	s, opts := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	info := checkInfoMsg(t, lc)
+	if !info.TLSRequired {
+		t.Fatalf("Expected TLSRequired to be true")
+	}
+	if info.TLSVerify {
+		t.Fatalf("Expected TLSVerify to be false")
+	}
+	// We should get a disconnect here since we have not upgraded to TLS.
+	expectDisconnect(t, lc)
+
+	// This should work ok.
+	sl, _ := runTLSSolicitLeafServer(opts)
+	defer sl.Shutdown()
+
+	checkLeafNodeConnected(t, s)
 }

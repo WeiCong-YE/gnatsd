@@ -15,8 +15,10 @@ package server
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"runtime"
 	"strconv"
@@ -138,6 +140,7 @@ func (s *Server) leafNodeAcceptLoop(ch chan struct{}) {
 
 	s.mu.Lock()
 	tlsReq := opts.LeafNode.TLSConfig != nil
+	tlsVerify := tlsReq && opts.LeafNode.TLSConfig.ClientAuth == tls.RequireAndVerifyClientCert
 	info := Info{
 		ID:           s.info.ID,
 		Version:      s.info.Version,
@@ -145,7 +148,7 @@ func (s *Server) leafNodeAcceptLoop(ch chan struct{}) {
 		GoVersion:    runtime.Version(),
 		AuthRequired: true,
 		TLSRequired:  tlsReq,
-		TLSVerify:    tlsReq,
+		TLSVerify:    tlsVerify,
 		MaxPayload:   s.info.MaxPayload, // TODO(dlc) - Allow override?
 		Proto:        1,                 // Fixed for now.
 	}
@@ -214,7 +217,6 @@ func (c *client) sendLeafConnect(tlsRequired bool) {
 		TLS:  tlsRequired,
 		Name: c.srv.info.ID,
 	}
-
 	b, err := json.Marshal(cinfo)
 	if err != nil {
 		c.Errorf("Error marshaling CONNECT to route: %v\n", err)
@@ -257,10 +259,7 @@ func (s *Server) createLeafNode(conn net.Conn, remote *RemoteLeafOpts) *client {
 
 	// Grab server variables
 	s.mu.Lock()
-	//infoJSON := s.leafNodeInfoJSON
 	info := s.leafNodeInfo
-	//authRequired := s.leafNodeInfo.AuthRequired
-	//tlsRequired := s.leafNodeInfo.TLSRequired
 	s.mu.Unlock()
 
 	// Grab lock
@@ -270,10 +269,128 @@ func (s *Server) createLeafNode(conn net.Conn, remote *RemoteLeafOpts) *client {
 
 	c.Debugf("LeafNode connection created")
 
+	if solicited {
+		// We need to wait here for the info, but not for too long.
+		b := make([]byte, MAX_CONTROL_LINE_SIZE)
+		c.nc.SetReadDeadline(time.Now().Add(time.Second))
+		n, err := c.nc.Read(b)
+		if err != nil {
+			c.mu.Unlock()
+			if err == io.EOF {
+				c.closeConnection(ClientClosed)
+			} else {
+				c.closeConnection(ReadError)
+			}
+			return nil
+		}
+		c.nc.SetReadDeadline(time.Time{})
+
+		c.mu.Unlock()
+		// Error will be handled below, so ignore here.
+		c.parse(b[:n])
+		c.mu.Lock()
+
+		if !c.flags.isSet(infoReceived) {
+			c.mu.Unlock()
+			c.Debugf("Did not get the remote leafnode's INFO, timed-out")
+			c.closeConnection(ReadError)
+			return nil
+		}
+
+		// Do TLS here as needed.
+		tlsRequired := c.leaf.remote.TLS || c.leaf.remote.TLSConfig != nil
+		if tlsRequired {
+			c.Debugf("Starting TLS leafnode client handshake")
+			// Specify the ServerName we are expecting.
+			var tlsConfig *tls.Config
+			if c.leaf.remote.TLSConfig != nil {
+				tlsConfig = c.leaf.remote.TLSConfig.Clone()
+			} else {
+				tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+			}
+
+			host, _, _ := net.SplitHostPort(c.leaf.remote.URL.Host)
+			tlsConfig.ServerName = host
+
+			c.nc = tls.Client(c.nc, tlsConfig)
+
+			conn := c.nc.(*tls.Conn)
+
+			// Setup the timeout
+			var wait time.Duration
+			if c.leaf.remote.TLSTimeout == 0 {
+				wait = TLS_TIMEOUT
+			} else {
+				wait = secondsToDuration(c.leaf.remote.TLSTimeout)
+			}
+			time.AfterFunc(wait, func() { tlsTimeout(c, conn) })
+			conn.SetReadDeadline(time.Now().Add(wait))
+
+			// Force handshake
+			c.mu.Unlock()
+			if err := conn.Handshake(); err != nil {
+				c.Errorf("TLS handshake error: %v", err)
+				c.closeConnection(TLSHandshakeError)
+				return nil
+			}
+			// Reset the read deadline
+			conn.SetReadDeadline(time.Time{})
+
+			// Re-Grab lock
+			c.mu.Lock()
+		}
+
+		c.sendLeafConnect(tlsRequired)
+		c.Debugf("Remote leaf node connect msg sent")
+	} else {
+		// Send our info to the other side.
+		var raw [nonceLen]byte
+		nonce := raw[:]
+		s.generateNonce(nonce)
+		info.Nonce = string(nonce)
+		info.CID = c.cid
+		b, _ := json.Marshal(info)
+		pcs := [][]byte{[]byte("INFO"), b, []byte(CR_LF)}
+		c.sendInfo(bytes.Join(pcs, []byte(" ")))
+
+		// Check to see if we need to spin up TLS.
+		if info.TLSRequired {
+			c.Debugf("Starting TLS leafnode server handshake")
+			c.nc = tls.Server(c.nc, opts.LeafNode.TLSConfig)
+			conn := c.nc.(*tls.Conn)
+
+			// Setup the timeout
+			ttl := secondsToDuration(opts.LeafNode.TLSTimeout)
+			time.AfterFunc(ttl, func() { tlsTimeout(c, conn) })
+			conn.SetReadDeadline(time.Now().Add(ttl))
+
+			// Force handshake
+			c.mu.Unlock()
+			if err := conn.Handshake(); err != nil {
+				c.Errorf("TLS handshake error: %v", err)
+				c.closeConnection(TLSHandshakeError)
+				return nil
+			}
+			// Reset the read deadline
+			conn.SetReadDeadline(time.Time{})
+
+			// Re-Grab lock
+			c.mu.Lock()
+
+			// Indicate that handshake is complete (used in monitoring)
+			c.flags.set(handshakeComplete)
+		}
+
+		// Leaf nodes will always require a CONNECT to let us know
+		// when we are properly bound to an account.
+		// The connection may have been closed
+		if c.nc != nil {
+			c.setAuthTimer(secondsToDuration(opts.LeafNode.AuthTimeout))
+		}
+	}
+
 	// Set the Ping timer
 	c.setPingTimer()
-
-	// FIXME(dlc) - Do TLS here.
 
 	// Spin up the read loop.
 	s.startGoRoutine(c.readLoop)
@@ -281,28 +398,29 @@ func (s *Server) createLeafNode(conn net.Conn, remote *RemoteLeafOpts) *client {
 	// Spin up the write loop.
 	s.startGoRoutine(c.writeLoop)
 
-	if solicited {
-		// We need to send our connect here.
-		// FIXME(dlc) - We should wait for info here.
-		c.Debugf("Remote leaf node connect msg sent")
-		c.sendLeafConnect( /*tlsRequired*/ false)
-	} else {
-		// Leaf nodes will always require a CONNECT to let us know
-		// when we are properly bound to an account.
-		c.setAuthTimer(secondsToDuration(opts.LeafNode.AuthTimeout))
-		// Send our info to the other side.
-		// FIXME(dlc) - Auth and nonce stuff
-		info.CID = c.cid
-		b, _ := json.Marshal(info)
-		pcs := [][]byte{[]byte("INFO"), b, []byte(CR_LF)}
-		c.sendInfo(bytes.Join(pcs, []byte(" ")))
-	}
 	c.mu.Unlock()
 
 	// Update server's accounting
 	s.addLeafNodeConnection(c)
 
 	return c
+}
+
+func (c *client) processLeafnodeInfo(info *Info) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.leaf == nil || c.nc == nil {
+		return
+	}
+
+	// Mark that the INFO protocol has been received.
+	// Capture a nonce here.
+	c.flags.set(infoReceived)
+	c.nonce = []byte(info.Nonce)
+	if info.TLSRequired && c.leaf.remote != nil {
+		c.leaf.remote.TLS = true
+	}
 }
 
 // Similar to setInfoHostPortAndGenerateJSON, but for leafNodeInfo.

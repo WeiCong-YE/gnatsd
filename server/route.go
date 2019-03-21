@@ -1089,7 +1089,7 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 
 	// Check for TLS
 	if tlsRequired {
-		// Copy off the config to add in ServerName if we
+		// Copy off the config to add in ServerName if we need to.
 		tlsConfig := opts.Cluster.TLSConfig.Clone()
 
 		// If we solicited, we will act like the client, otherwise the server.
