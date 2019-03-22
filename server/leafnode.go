@@ -306,6 +306,8 @@ func (s *Server) createLeafNode(conn net.Conn, remote *RemoteLeafOpts) *client {
 		}
 		// FIXME(dlc) - Make this resolve at startup.
 		c.acc, _ = s.LookupAccount(remote.LocalAccount)
+		// Make sure we register with the account here.
+		c.registerWithAccount(c.acc)
 		c.leaf.remote = remote
 	}
 

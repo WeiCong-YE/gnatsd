@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/nats-io/gnatsd/server"
+	"github.com/nats-io/go-nats"
 	"github.com/nats-io/jwt"
 	"github.com/nats-io/nkeys"
 )
@@ -862,20 +863,61 @@ func TestLeafNodeTLS(t *testing.T) {
 	checkLeafNodeConnected(t, s)
 }
 
-func TestLeafNodeOperatorModel(t *testing.T) {
+func runLeafNodeOperatorServer(t *testing.T) (*server.Server, *server.Options, string) {
+	t.Helper()
 	content := `
 	port: -1
 	operator = "./configs/nkeys/op.jwt"
 	resolver = MEMORY
-
 	leafnodes {
 		listen: "127.0.0.1:-1"
 	}
 	`
 	conf := createConfFile(t, []byte(content))
-	defer os.Remove(conf)
-
 	s, opts := RunServerWithConfig(conf)
+	return s, opts, conf
+}
+
+func genCredsFile(t *testing.T, jwt string, seed []byte) string {
+	creds := `
+		-----BEGIN NATS USER JWT-----
+		%s
+		------END NATS USER JWT------
+
+		************************* IMPORTANT *************************
+		NKEY Seed printed below can be used to sign and prove identity.
+		NKEYs are sensitive and should be treated as secrets.
+
+		-----BEGIN USER NKEY SEED-----
+		%s
+		------END USER NKEY SEED------
+
+		*************************************************************
+		`
+	return createConfFile(t, []byte(strings.Replace(fmt.Sprintf(creds, jwt, seed), "\t\t", "", -1)))
+}
+
+func runSolicitWithCredentials(t *testing.T, opts *server.Options, creds string) (*server.Server, *server.Options, string) {
+	content := `
+		port: -1
+		leafnodes {
+			remotes = [
+				{
+					url: nats-leaf://127.0.0.1:%d
+					credentials: "%s"
+				}
+			]
+		}
+		`
+	config := fmt.Sprintf(content, opts.LeafNode.Port, creds)
+	conf := createConfFile(t, []byte(config))
+	s, opts := RunServerWithConfig(conf)
+	return s, opts, conf
+}
+
+func TestLeafNodeOperatorModel(t *testing.T) {
+	s, opts, conf := runLeafNodeOperatorServer(t)
+	defer os.Remove(conf)
 	defer s.Shutdown()
 
 	// Make sure we get disconnected without proper credentials etc.
@@ -900,43 +942,91 @@ func TestLeafNodeOperatorModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error generating user JWT: %v", err)
 	}
-	creds := `
-		-----BEGIN NATS USER JWT-----
-		%s
-		------END NATS USER JWT------
-
-		************************* IMPORTANT *************************
-		NKEY Seed printed below can be used to sign and prove identity.
-		NKEYs are sensitive and should be treated as secrets.
-
-		-----BEGIN USER NKEY SEED-----
-		%s
-		------END USER NKEY SEED------
-
-		*************************************************************
-		`
-
 	seed, _ := kp.Seed()
-	mycreds := createConfFile(t, []byte(strings.Replace(fmt.Sprintf(creds, ujwt, seed), "\t\t", "", -1)))
+	mycreds := genCredsFile(t, ujwt, seed)
 	defer os.Remove(mycreds)
 
-	lncontent := `
-		port: -1
-		leafnodes {
-			remotes = [
-				{
-					url: nats-leaf://127.0.0.1:%d
-					credentials: "%s"
-				}
-			]
-		}
-		`
-	lnconfig := fmt.Sprintf(lncontent, opts.LeafNode.Port, mycreds)
-	lnconf := createConfFile(t, []byte(lnconfig))
+	sl, _, lnconf := runSolicitWithCredentials(t, opts, mycreds)
 	defer os.Remove(lnconf)
-
-	sl, _ := RunServerWithConfig(lnconf)
 	defer sl.Shutdown()
 
 	checkLeafNodeConnected(t, s)
+}
+
+func TestLeafNodeMultipleAccounts(t *testing.T) {
+	// So we will create a main server with two accounts. The remote server, acting as a leaf node, will simply have
+	// the $G global account and no auth. Make sure things work properly here.
+
+	s, opts, conf := runLeafNodeOperatorServer(t)
+	defer os.Remove(conf)
+	defer s.Shutdown()
+
+	// Setup the two accounts for this server.
+	_, akp1 := createAccount(t, s)
+	kp1, _ := nkeys.CreateUser()
+	pub1, _ := kp1.PublicKey()
+	nuc1 := jwt.NewUserClaims(pub1)
+	ujwt1, err := nuc1.Encode(akp1)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+
+	_, akp2 := createAccount(t, s)
+
+	// Create the leaf node server using the first account.
+	seed, _ := kp1.Seed()
+	mycreds := genCredsFile(t, ujwt1, seed)
+	defer os.Remove(mycreds)
+
+	sl, lopts, lnconf := runSolicitWithCredentials(t, opts, mycreds)
+	defer os.Remove(lnconf)
+	defer sl.Shutdown()
+
+	checkLeafNodeConnected(t, s)
+
+	// To connect to main server.
+	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+
+	nc1, err := nats.Connect(url, createUserCreds(t, s, akp1))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc1.Close()
+
+	nc2, err := nats.Connect(url, createUserCreds(t, s, akp2))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc2.Close()
+
+	// This is a client connected to the leaf node with no auth,
+	// binding to account1 via leafnode connection.
+	// To connect to leafnode server.
+	lurl := fmt.Sprintf("nats://%s:%d", lopts.Host, lopts.Port)
+	ncl, err := nats.Connect(lurl)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer ncl.Close()
+
+	lsub, _ := ncl.SubscribeSync("foo.test")
+
+	// Wait for the sub to propagate.
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if subs := s.NumSubscriptions(); subs < 1 {
+			return fmt.Errorf("Number of subs is %d", subs)
+		}
+		return nil
+	})
+
+	// Now send from nc1 with account 1, should be received by our leafnode subscriber.
+	nc1.Publish("foo.test", nil)
+
+	// Wait for the message to arrive
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if msgs, _ := lsub.QueuedMsgs(); msgs != 1 {
+			return fmt.Errorf("Number of msgs is %d", msgs)
+		}
+		return nil
+	})
 }
