@@ -670,6 +670,7 @@ func (s *Server) enableAccountTracking(a *Account) {
 func (s *Server) sendLeafNodeConnect(a *Account) {
 	s.mu.Lock()
 	// If we do not have any gateways defined this should also be a no-op.
+	// FIXME(dlc) - if we do accounting for operator limits might have to send regardless.
 	if a == nil || !s.eventsEnabled() || !s.gateway.enabled {
 		s.mu.Unlock()
 		return

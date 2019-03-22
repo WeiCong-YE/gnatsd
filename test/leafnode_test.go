@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"github.com/nats-io/gnatsd/server"
+	"github.com/nats-io/jwt"
+	"github.com/nats-io/nkeys"
 )
 
 func createLeafConn(t tLogger, host string, port int) net.Conn {
@@ -69,11 +71,9 @@ func TestLeafNodeInfo(t *testing.T) {
 	if !info.AuthRequired {
 		t.Fatalf("AuthRequired should always be true for leaf nodes")
 	}
+	sendProto(t, lc, "CONNECT {}\r\n")
 
-	// Make sure we are accounting for the leaf node and tracking it.
-	if nln := s.NumLeafNodes(); nln != 1 {
-		t.Fatalf("Expected 1 leaf node, got %d", nln)
-	}
+	checkLeafNodeConnected(t, s)
 
 	// Now close connection, make sure we are doing the right accounting in the server.
 	lc.Close()
@@ -91,36 +91,37 @@ func TestNumLeafNodes(t *testing.T) {
 	defer s.Shutdown()
 
 	createNewLeafNode := func() net.Conn {
+		t.Helper()
 		lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 		checkInfoMsg(t, lc)
+		sendProto(t, lc, "CONNECT {}\r\n")
 		return lc
 	}
-	if nln := s.NumLeafNodes(); nln != 0 {
-		t.Fatalf("Expected NumLeafNodes() == %d, got %d", 0, nln)
+	checkLFCount := func(n int) {
+		t.Helper()
+		checkFor(t, time.Second, 10*time.Millisecond, func() error {
+			if nln := s.NumLeafNodes(); nln != n {
+				return fmt.Errorf("Number of leaf nodes is %d", nln)
+			}
+			return nil
+		})
 	}
+	checkLFCount(0)
+
 	lc1 := createNewLeafNode()
 	defer lc1.Close()
-	if nln := s.NumLeafNodes(); nln != 1 {
-		t.Fatalf("Expected NumLeafNodes() == %d, got %d", 1, nln)
-	}
+	checkLFCount(1)
+
 	lc2 := createNewLeafNode()
 	defer lc2.Close()
-	if nln := s.NumLeafNodes(); nln != 2 {
-		t.Fatalf("Expected NumLeafNodes() == %d, got %d", 2, nln)
-	}
+	checkLFCount(2)
+
 	// Now test remove works.
-	closeAndWait := func(c net.Conn) {
-		c.Close()
-		time.Sleep(25 * time.Millisecond)
-	}
-	closeAndWait(lc1)
-	if nln := s.NumLeafNodes(); nln != 1 {
-		t.Fatalf("Expected NumLeafNodes() == %d, got %d", 1, nln)
-	}
-	closeAndWait(lc2)
-	if nln := s.NumLeafNodes(); nln != 0 {
-		t.Fatalf("Expected NumLeafNodes() == %d, got %d", 0, nln)
-	}
+	lc1.Close()
+	checkLFCount(1)
+
+	lc2.Close()
+	checkLFCount(0)
 }
 
 func TestLeafNodeRequiresConnect(t *testing.T) {
@@ -144,7 +145,6 @@ func TestLeafNodeRequiresConnect(t *testing.T) {
 	}
 
 	// Now wait and make sure we get disconnected.
-	time.Sleep(5 * time.Millisecond)
 	errBuf := expectResult(t, lc, errRe)
 
 	if !strings.Contains(string(errBuf), "Authentication Timeout") {
@@ -781,7 +781,6 @@ func TestLeafNodeBasicAuth(t *testing.T) {
 
 	// This should fail since we want u/p
 	setupConn(t, lc)
-	time.Sleep(5 * time.Millisecond)
 	errBuf := expectResult(t, lc, errRe)
 	if !strings.Contains(string(errBuf), "Authorization Violation") {
 		t.Fatalf("Authentication Timeout response incorrect: %q", errBuf)
@@ -794,7 +793,6 @@ func TestLeafNodeBasicAuth(t *testing.T) {
 
 	// This should fail since we want u/p
 	setupConnWithUserPass(t, lc, "derek", "badpassword")
-	time.Sleep(5 * time.Millisecond)
 	errBuf = expectResult(t, lc, errRe)
 	if !strings.Contains(string(errBuf), "Authorization Violation") {
 		t.Fatalf("Authentication Timeout response incorrect: %q", errBuf)
@@ -859,6 +857,85 @@ func TestLeafNodeTLS(t *testing.T) {
 
 	// This should work ok.
 	sl, _ := runTLSSolicitLeafServer(opts)
+	defer sl.Shutdown()
+
+	checkLeafNodeConnected(t, s)
+}
+
+func TestLeafNodeOperatorModel(t *testing.T) {
+	content := `
+	port: -1
+	operator = "./configs/nkeys/op.jwt"
+	resolver = MEMORY
+
+	leafnodes {
+		listen: "127.0.0.1:-1"
+	}
+	`
+	conf := createConfFile(t, []byte(content))
+	defer os.Remove(conf)
+
+	s, opts := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// Make sure we get disconnected without proper credentials etc.
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	// This should fail since we want user jwt, signed nonce etc.
+	setupConn(t, lc)
+	errBuf := expectResult(t, lc, errRe)
+	if !strings.Contains(string(errBuf), "Authorization Violation") {
+		t.Fatalf("Authentication Timeout response incorrect: %q", errBuf)
+	}
+	expectDisconnect(t, lc)
+
+	// Setup account and a user that will be used by the remote leaf node server.
+	// createAccount automatically registers with resolver etc..
+	_, akp := createAccount(t, s)
+	kp, _ := nkeys.CreateUser()
+	pub, _ := kp.PublicKey()
+	nuc := jwt.NewUserClaims(pub)
+	ujwt, err := nuc.Encode(akp)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+	creds := `
+		-----BEGIN NATS USER JWT-----
+		%s
+		------END NATS USER JWT------
+
+		************************* IMPORTANT *************************
+		NKEY Seed printed below can be used to sign and prove identity.
+		NKEYs are sensitive and should be treated as secrets.
+
+		-----BEGIN USER NKEY SEED-----
+		%s
+		------END USER NKEY SEED------
+
+		*************************************************************
+		`
+
+	seed, _ := kp.Seed()
+	mycreds := createConfFile(t, []byte(strings.Replace(fmt.Sprintf(creds, ujwt, seed), "\t\t", "", -1)))
+	defer os.Remove(mycreds)
+
+	lncontent := `
+		port: -1
+		leafnodes {
+			remotes = [
+				{
+					url: nats-leaf://127.0.0.1:%d
+					credentials: "%s"
+				}
+			]
+		}
+		`
+	lnconfig := fmt.Sprintf(lncontent, opts.LeafNode.Port, mycreds)
+	lnconf := createConfFile(t, []byte(lnconfig))
+	defer os.Remove(lnconf)
+
+	sl, _ := RunServerWithConfig(lnconf)
 	defer sl.Shutdown()
 
 	checkLeafNodeConnected(t, s)

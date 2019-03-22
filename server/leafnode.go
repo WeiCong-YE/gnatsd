@@ -16,15 +16,20 @@ package server
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/nats-io/nkeys"
 )
 
 type leaf struct {
@@ -74,15 +79,26 @@ func validateLeafNode(o *Options) error {
 	return nil
 }
 
+func (s *Server) reConnectToRemoteLeafNode(remote *RemoteLeafOpts) {
+	// TODO(dlc) - We will use route delay semantics for now.
+	delay := DEFAULT_ROUTE_RECONNECT
+	select {
+	case <-time.After(delay):
+	case <-s.quitCh:
+		s.grWG.Done()
+		return
+	}
+	s.connectToRemoteLeafNode(remote)
+}
+
 func (s *Server) connectToRemoteLeafNode(remote *RemoteLeafOpts) {
 	defer s.grWG.Done()
 
 	if remote == nil || remote.URL == nil {
-		s.Debugf("Empty remote leaf node definition, can not connect")
+		s.Debugf("Empty remote leaf node definition, nothing to connect")
 		return
 	}
 
-	// TODO(dlc) - Auth stuff here
 	for s.isRunning() && s.remoteLeafNodeStillValid(remote) {
 		rURL := remote.URL
 		s.Debugf("Trying to connect as leaf node to remote server on %s", rURL.Host)
@@ -204,19 +220,55 @@ func (s *Server) leafNodeAcceptLoop(ch chan struct{}) {
 	s.done <- true
 }
 
+// RegEx to match a creds file with user JWT and Seed.
+var credsRe = regexp.MustCompile(`\s*(?:(?:[-]{3,}[^\n]*[-]{3,}\n)(.+)(?:\n\s*[-]{3,}[^\n]*[-]{3,}\n))`)
+
 // Lock should be held entering here.
 func (c *client) sendLeafConnect(tlsRequired bool) {
-	var user, pass string
-	if userInfo := c.leaf.remote.URL.User; userInfo != nil {
-		user = userInfo.Username()
-		pass, _ = userInfo.Password()
-	}
+	// We support basic user/pass and operator based user JWT with signatures.
 	cinfo := leafConnectInfo{
-		User: user,
-		Pass: pass,
 		TLS:  tlsRequired,
 		Name: c.srv.info.ID,
 	}
+
+	// Check for credentials first, that will take precedence..
+	if creds := c.leaf.remote.Credentials; creds != "" {
+		c.Debugf("Authenticating with credentials file %q", c.leaf.remote.Credentials)
+		contents, err := ioutil.ReadFile(creds)
+		if err != nil {
+			c.Errorf("%v", err)
+			return
+		}
+		defer wipeSlice(contents)
+		items := credsRe.FindAllSubmatch(contents, -1)
+		if len(items) < 2 {
+			c.Errorf("Credentials file malformed")
+			return
+		}
+		// First result should be the user JWT.
+		// We copy here so that the file containing the seed will be wiped appropriately.
+		raw := items[0][1]
+		tmp := make([]byte, len(raw))
+		copy(tmp, raw)
+		// Seed is second item.
+		kp, err := nkeys.FromSeed(items[1][1])
+		if err != nil {
+			c.Errorf("Credentials file has malformed seed")
+			return
+		}
+		// Wipe our key on exit.
+		defer kp.Wipe()
+
+		sigraw, _ := kp.Sign(c.nonce)
+		sig := base64.RawURLEncoding.EncodeToString(sigraw)
+		cinfo.JWT = string(tmp)
+		cinfo.Sig = sig
+	} else if userInfo := c.leaf.remote.URL.User; userInfo != nil {
+		cinfo.User = userInfo.Username()
+		pass, _ := userInfo.Password()
+		cinfo.Pass = pass
+	}
+
 	b, err := json.Marshal(cinfo)
 	if err != nil {
 		c.Errorf("Error marshaling CONNECT to route: %v\n", err)
@@ -344,10 +396,10 @@ func (s *Server) createLeafNode(conn net.Conn, remote *RemoteLeafOpts) *client {
 		c.Debugf("Remote leaf node connect msg sent")
 	} else {
 		// Send our info to the other side.
-		var raw [nonceLen]byte
-		nonce := raw[:]
-		s.generateNonce(nonce)
-		info.Nonce = string(nonce)
+		// Remember the nonce we sent here for signatures, etc.
+		c.nonce = make([]byte, nonceLen)
+		s.generateNonce(c.nonce)
+		info.Nonce = string(c.nonce)
 		info.CID = c.cid
 		b, _ := json.Marshal(info)
 		pcs := [][]byte{[]byte("INFO"), b, []byte(CR_LF)}
@@ -400,8 +452,10 @@ func (s *Server) createLeafNode(conn net.Conn, remote *RemoteLeafOpts) *client {
 
 	c.mu.Unlock()
 
-	// Update server's accounting
-	s.addLeafNodeConnection(c)
+	// Update server's accounting here if we solicited.
+	if solicited {
+		s.addLeafNodeConnection(c)
+	}
 
 	return c
 }
@@ -460,14 +514,15 @@ func (s *Server) removeLeafNodeConnection(c *client) {
 }
 
 type leafConnectInfo struct {
-	Nkey    string `json:"nkey,omitempty"`
-	JWT     string `json:"jwt,omitempty"`
-	Sig     string `json:"sig,omitempty"`
-	User    string `json:"user,omitempty"`
-	Pass    string `json:"pass,omitempty"`
-	TLS     bool   `json:"tls_required"`
-	Comp    bool   `json:"compression,omitempty"`
-	Name    string `json:"name,omitempty"`
+	JWT  string `json:"jwt,omitempty"`
+	Sig  string `json:"sig,omitempty"`
+	User string `json:"user,omitempty"`
+	Pass string `json:"pass,omitempty"`
+	TLS  bool   `json:"tls_required"`
+	Comp bool   `json:"compression,omitempty"`
+	Name string `json:"name,omitempty"`
+
+	// Just used to detect wrong connection attempts.
 	Gateway string `json:"gateway,omitempty"`
 }
 
@@ -513,6 +568,9 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 		c.sendAllAccountSubs()
 		s.grWG.Done()
 	})
+
+	// Add in the leafnode here since we passed through auth at this point.
+	s.addLeafNodeConnection(c)
 
 	// Announce the account connect event for a leaf node.
 	// This will no-op as needed.
