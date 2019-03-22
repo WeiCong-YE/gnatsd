@@ -592,8 +592,14 @@ func (c *client) initLeafNodeSmap() {
 	// Collect all subs here.
 	_subs := [256]*subscription{}
 	subs := _subs[:0]
+	ims := []string{}
 	acc.mu.RLock()
 	acc.sl.All(&subs)
+	// Since leaf nodes only send on interest, if the bound
+	// account has import services we need to send those over.
+	for isubj := range acc.imports.services {
+		ims = append(ims, isubj)
+	}
 	acc.mu.RUnlock()
 
 	// Now walk the results and add them to our smap
@@ -603,6 +609,10 @@ func (c *client) initLeafNodeSmap() {
 		if c != sub.client {
 			c.leaf.smap[keyFromSub(sub)] += 1
 		}
+	}
+	// FIXME(dlc) - We need to update appropriately on an account claims update.
+	for _, isubj := range ims {
+		c.leaf.smap[isubj] += 1
 	}
 	c.mu.Unlock()
 }
@@ -1009,6 +1019,7 @@ func (c *client) processInboundLeafMsg(msg []byte) {
 
 	// Check to see if we have a routed message with a service reply.
 	if isServiceReply(c.pa.reply) && acc != nil {
+		// TODO(dlc) - Figure out what this means.
 		panic("Not Implemented")
 	}
 

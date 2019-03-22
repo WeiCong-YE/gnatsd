@@ -817,6 +817,11 @@ func (s *Server) AccountResolver() AccountResolver {
 	return s.accResolver
 }
 
+// UpdateAccountClaims will call updateAccountClaims.
+func (s *Server) UpdateAccountClaims(a *Account, ac *jwt.AccountClaims) {
+	s.updateAccountClaims(a, ac)
+}
+
 // updateAccountClaims will update and existing account with new claims.
 // This will replace any exports or imports previously defined.
 func (s *Server) updateAccountClaims(a *Account, ac *jwt.AccountClaims) {

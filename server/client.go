@@ -2317,6 +2317,7 @@ func (c *client) checkForImportServices(acc *Account, msg []byte) {
 		if (c.kind == ROUTER || c.kind == GATEWAY) && c.pa.queues == nil && len(rr.qsubs) > 0 {
 			c.makeQFilter(rr.qsubs)
 		}
+
 		sendToGWs := c.srv.gateway.enabled && (c.kind == CLIENT || c.kind == SYSTEM)
 		queues := c.processMsgResults(rm.acc, rr, msg, []byte(rm.to), nrr, sendToGWs)
 		// If this is not a gateway connection but gateway is enabled,
@@ -2540,6 +2541,10 @@ sendToRoutesOrLeafs:
 		} else {
 			// Leaf nodes are LMSG
 			mh[0] = 'L'
+			// Remap subject if its a shadow subscription, treat like a normal client.
+			if rt.sub.im != nil && rt.sub.im.prefix != "" {
+				mh = append(mh, rt.sub.im.prefix...)
+			}
 		}
 		mh = append(mh, subject...)
 		mh = append(mh, ' ')
